@@ -87,6 +87,30 @@ describe("compose", () => {
 			expect(result).toEqual(arr3);
 		});
 
+		it("should fold array add then modify into a single add with final value", () => {
+			const instance = jsondiffpatch.create({
+				objectHash: (obj: { id?: number }) => obj?.id?.toString(),
+			});
+
+			const arr1 = [{ id: 1, v: "a" }];
+			const arr2 = [{ id: 1, v: "a" }, { id: 2, v: "b" }];
+			const arr3 = [{ id: 1, v: "a" }, { id: 2, v: "modified" }];
+
+			const delta1 = instance.diff(arr1, arr2);
+			const delta2 = instance.diff(arr2, arr3);
+
+			expect(delta1).toEqual({ _t: "a", 1: [{ id: 2, v: "b" }] });
+
+			const composed = instance.compose(delta1, delta2);
+
+			const composedArr = composed as { _t: string; 1: unknown[] };
+			expect(composedArr._t).toBe("a");
+			expect(composedArr[1]).toEqual([{ id: 2, v: "modified" }]);
+
+			const result = instance.patch(instance.clone(arr1), composed);
+			expect(result).toEqual(arr3);
+		});
+
 		it("should handle array moves with subsequent operations", () => {
 			const instance = jsondiffpatch.create({
 				objectHash: (obj: { id?: number }) => obj?.id?.toString(),
@@ -198,6 +222,29 @@ describe("compose", () => {
 
 			const result = instance.patch(instance.clone(obj1), composed);
 			expect(result).toEqual(obj3);
+		});
+
+		it("should produce [originalText, newVal] when text diff is followed by modified delta", () => {
+			const textInstance = jsondiffpatch.create({
+				textDiff: { diffMatchPatch: diff_match_patch, minLength: 1 },
+			});
+			const plainInstance = jsondiffpatch.create();
+
+			const delta1 = textInstance.diff(
+				{ text: "hello world" },
+				{ text: "hello there world" },
+			);
+			const delta2 = plainInstance.diff(
+				{ text: "hello there world" },
+				{ text: "completely different" },
+			);
+
+			expect(delta1).toEqual({ text: expect.arrayContaining([expect.any(String), 0, 2]) });
+			expect(delta2).toEqual({ text: ["hello there world", "completely different"] });
+
+			const composed = textInstance.compose(delta1, delta2);
+
+			expect(composed).toEqual({ text: ["hello world", "completely different"] });
 		});
 
 		it("should return undefined when text modifications cancel out", () => {

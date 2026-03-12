@@ -107,6 +107,17 @@ class DiffPatcher {
 		}
 
 		if (
+			Array.isArray(delta1) &&
+			isAddedDelta(delta1 as Delta) &&
+			typeof delta2 === 'object' &&
+			delta2 !== null &&
+			!Array.isArray(delta2)
+		) {
+			const patched = this.patch(delta1[0], delta2 as Delta);
+			return [patched];
+		}
+
+		if (
 			typeof delta1 === 'object' &&
 			typeof delta2 === 'object' &&
 			delta1 !== null &&
