@@ -2,6 +2,10 @@ import type { diff_match_patch } from "@dmsnell/diff-match-patch";
 import type Context from "./contexts/context.js";
 import type DiffContext from "./contexts/diff.js";
 
+export const DELTA_TYPE_TEXTDIFF = 2 as const;
+export const DELTA_TYPE_MOVED = 3 as const;
+export const DELTA_DELETED_MARKER = 0 as const;
+
 export interface Options {
 	objectHash?: (item: object, index?: number) => string | undefined;
 	matchByPosition?: boolean;

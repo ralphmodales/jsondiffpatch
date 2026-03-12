@@ -51,3 +51,10 @@ export function clone(value: unknown) {
 	}
 	return defaultInstance.clone(value);
 }
+
+export function compose(delta1?: Delta, delta2?: Delta) {
+	if (!defaultInstance) {
+		defaultInstance = new DiffPatcher();
+	}
+	return defaultInstance.compose(delta1, delta2);
+}

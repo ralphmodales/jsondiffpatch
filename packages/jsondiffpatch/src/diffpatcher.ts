@@ -10,7 +10,23 @@ import * as dates from "./filters/dates.js";
 import * as nested from "./filters/nested.js";
 import * as texts from "./filters/texts.js";
 import * as trivial from "./filters/trivial.js";
-import type { Delta, Options } from "./types.js";
+import {
+	type Delta,
+	type Options,
+	type TextDiffDelta,
+	type MovedDelta,
+	type DeletedDelta,
+	type ArrayDelta,
+	DELTA_TYPE_TEXTDIFF,
+	DELTA_TYPE_MOVED,
+	DELTA_DELETED_MARKER,
+	isAddedDelta,
+	isModifiedDelta,
+	isDeletedDelta,
+	isTextDiffDelta,
+	isMovedDelta,
+	isArrayDelta,
+} from "./types.js";
 
 class DiffPatcher {
 	processor: Processor;
@@ -77,6 +93,379 @@ class DiffPatcher {
 
 	clone(value: unknown) {
 		return clone(value);
+	}
+
+	compose(delta1?: Delta, delta2?: Delta): Delta | undefined {
+		if (delta1 === undefined) return delta2;
+		if (delta2 === undefined) return delta1;
+		return this.composeDelta(delta1, delta2, []);
+	}
+
+	private composeDelta(delta1: Delta, delta2: Delta, path: string[]): Delta {
+		if (Array.isArray(delta1) && Array.isArray(delta2)) {
+			return this.composeLeafDelta(delta1, delta2, path);
+		}
+
+		if (
+			typeof delta1 === 'object' &&
+			typeof delta2 === 'object' &&
+			delta1 !== null &&
+			delta2 !== null &&
+			!Array.isArray(delta1) &&
+			!Array.isArray(delta2)
+		) {
+			const isArr1 = isArrayDelta(delta1 as Delta);
+			const isArr2 = isArrayDelta(delta2 as Delta);
+			if (isArr1 && isArr2) {
+				return this.composeArrayDeltas(
+					delta1 as ArrayDelta,
+					delta2 as ArrayDelta,
+					path,
+				);
+			}
+			if (!isArr1 && !isArr2) {
+				return this.composeObjectDelta(
+					delta1 as Record<string, Delta>,
+					delta2 as Record<string, Delta>,
+					path,
+				);
+			}
+		}
+
+		this.throwIncompatible(path);
+	}
+
+	private throwIncompatible(path: string[]): never {
+		throw new Error(
+			`Cannot compose deltas: incompatible transformations at path [${path.join(', ')}]`,
+		);
+	}
+
+	private composeLeafDelta(
+		delta1: unknown[],
+		delta2: unknown[],
+		path: string[],
+	): Delta {
+		const d1 = delta1 as Delta;
+		const d2 = delta2 as Delta;
+
+		if (isAddedDelta(d1)) {
+			if (isModifiedDelta(d2)) return [d2[1]];
+			if (isDeletedDelta(d2)) return undefined;
+			if (isTextDiffDelta(d2)) {
+				const patched = this.applyTextPatch(String(d1[0]), d2[0], path);
+				return [patched];
+			}
+			this.throwIncompatible(path);
+		}
+
+		if (isModifiedDelta(d1)) {
+			if (isModifiedDelta(d2)) {
+				const d1IsCompact = d1[0] === DELTA_DELETED_MARKER;
+				const d2IsCompact = d2[0] === DELTA_DELETED_MARKER;
+				if (!d2IsCompact && !this.deepEqual(d1[1], d2[0])) {
+					this.throwIncompatible(path);
+				}
+				if (d1IsCompact) {
+					return [DELTA_DELETED_MARKER, d2[1]];
+				}
+				if (this.deepEqual(d1[0], d2[1])) return undefined;
+				return [d1[0], d2[1]];
+			}
+			if (isDeletedDelta(d2)) {
+				return [d1[0], DELTA_DELETED_MARKER, DELTA_DELETED_MARKER] as DeletedDelta;
+			}
+			if (isTextDiffDelta(d2)) {
+				const finalText = this.applyTextPatch(String(d1[1]), d2[0], path);
+				if (this.deepEqual(d1[0], finalText)) return undefined;
+				return [d1[0], finalText];
+			}
+			this.throwIncompatible(path);
+		}
+
+		if (isDeletedDelta(d1)) {
+			if (isAddedDelta(d2)) {
+				const d1IsCompact = d1[0] === DELTA_DELETED_MARKER;
+				if (d1IsCompact) {
+					return [DELTA_DELETED_MARKER, d2[0]];
+				}
+				if (this.deepEqual(d1[0], d2[0])) return undefined;
+				return [d1[0], d2[0]];
+			}
+			this.throwIncompatible(path);
+		}
+
+		if (isTextDiffDelta(d1)) {
+			if (isTextDiffDelta(d2)) {
+				return this.composeTextDiffs(d1, d2, path);
+			}
+			if (isModifiedDelta(d2)) {
+				const originalText = this.extractOriginalTextFromPatch(d1[0]);
+				if (originalText !== null && this.deepEqual(originalText, d2[1])) {
+					return undefined;
+				}
+				return [originalText ?? d2[0], d2[1]];
+			}
+			if (isDeletedDelta(d2)) {
+				const originalText = this.extractOriginalTextFromPatch(d1[0]);
+				return [
+					originalText ?? '',
+					DELTA_DELETED_MARKER,
+					DELTA_DELETED_MARKER,
+				] as DeletedDelta;
+			}
+			this.throwIncompatible(path);
+		}
+
+		if (isMovedDelta(d1)) {
+			if (isMovedDelta(d2)) {
+				return [d1[0], d2[1], DELTA_TYPE_MOVED] as MovedDelta;
+			}
+			this.throwIncompatible(path);
+		}
+
+		this.throwIncompatible(path);
+	}
+
+	private applyTextPatch(
+		text: string,
+		patchString: string,
+		path: string[],
+	): string {
+		const options = this.processor.options();
+		if (!options?.textDiff?.diffMatchPatch) {
+			throw new Error('diff_match_patch not configured');
+		}
+		const dmp = new options.textDiff.diffMatchPatch();
+		const patches = dmp.patch_fromText(patchString);
+		const [result, applied] = dmp.patch_apply(patches, text);
+		for (const success of applied) {
+			if (!success) {
+				this.throwIncompatible(path);
+			}
+		}
+		return result as string;
+	}
+
+	private extractOriginalTextFromPatch(patchString: string): string | null {
+		const options = this.processor.options();
+		if (!options?.textDiff?.diffMatchPatch) return null;
+		const dmp = new options.textDiff.diffMatchPatch();
+		const patches = dmp.patch_fromText(patchString);
+		let text = '';
+		for (const patch of patches) {
+			for (const [op, content] of patch.diffs) {
+				if (op !== 1) text += content;
+			}
+		}
+		return text.length > 0 ? text : null;
+	}
+
+	private composeTextDiffs(
+		delta1: TextDiffDelta,
+		delta2: TextDiffDelta,
+		path: string[],
+	): Delta {
+		const originalText = this.extractOriginalTextFromPatch(delta1[0]);
+		if (originalText === null) this.throwIncompatible(path);
+		const intermediate = this.applyTextPatch(originalText, delta1[0], path);
+		const final = this.applyTextPatch(intermediate, delta2[0], path);
+		if (originalText === final) return undefined;
+		const composedDelta = this.diff(originalText, final);
+		if (isTextDiffDelta(composedDelta)) return composedDelta;
+		if (isModifiedDelta(composedDelta)) return composedDelta;
+		return [originalText, final];
+	}
+
+	private composeObjectDelta(
+		delta1: Record<string, Delta>,
+		delta2: Record<string, Delta>,
+		path: string[],
+	): Delta {
+		const result: Record<string, Delta> = {};
+		const keys = new Set([...Object.keys(delta1), ...Object.keys(delta2)]);
+
+		for (const key of keys) {
+			if (key === '_t') continue;
+			const d1 = delta1[key];
+			const d2 = delta2[key];
+			if (d1 !== undefined && d2 !== undefined) {
+				const composed = this.composeDelta(d1, d2, [...path, key]);
+				if (composed !== undefined) result[key] = composed;
+			} else if (d1 !== undefined) {
+				result[key] = d1;
+			} else if (d2 !== undefined) {
+				result[key] = d2;
+			}
+		}
+
+		return Object.keys(result).length > 0 ? result : undefined;
+	}
+
+	private composeArrayDeltas(
+		delta1: ArrayDelta,
+		delta2: ArrayDelta,
+		path: string[],
+	): Delta {
+		const result: Record<string, unknown> = { _t: 'a' };
+		const d1Moves = new Map<number, number>();
+		const d1Additions = new Set<number>();
+		const d1Deletions = new Set<number>();
+
+		for (const key in delta1) {
+			if (key === '_t') continue;
+			const value = (delta1 as Record<string, unknown>)[key] as Delta;
+			if (key.startsWith('_')) {
+				const idx = parseInt(key.substring(1), 10);
+				if (isMovedDelta(value)) {
+					d1Moves.set(idx, value[1]);
+				} else if (isDeletedDelta(value)) {
+					d1Deletions.add(idx);
+				}
+			} else {
+				const idx = parseInt(key, 10);
+				if (isAddedDelta(value)) d1Additions.add(idx);
+			}
+		}
+
+		for (const key in delta1) {
+			if (key === '_t') continue;
+			const value = (delta1 as Record<string, unknown>)[key] as Delta;
+
+			if (key.startsWith('_')) {
+				if (isMovedDelta(value)) {
+					const targetIdx = value[1];
+					const d2UnderscoreKey = `_${targetIdx}`;
+					const d2ValueAtTarget = (delta2 as Record<string, unknown>)[d2UnderscoreKey] as Delta;
+					if (d2ValueAtTarget !== undefined && isDeletedDelta(d2ValueAtTarget)) {
+						result[key] = [value[0], DELTA_DELETED_MARKER, DELTA_DELETED_MARKER] as DeletedDelta;
+					} else if (d2ValueAtTarget !== undefined && isMovedDelta(d2ValueAtTarget)) {
+						result[key] = [value[0], d2ValueAtTarget[1], DELTA_TYPE_MOVED] as MovedDelta;
+					} else {
+						result[key] = value;
+					}
+				} else {
+					result[key] = value;
+				}
+			} else {
+				const idx = parseInt(key, 10);
+				if (isAddedDelta(value)) {
+					const d2UnderscoreKey = `_${idx}`;
+					const d2ValueAtIdx = (delta2 as Record<string, unknown>)[d2UnderscoreKey] as Delta;
+					if (d2ValueAtIdx !== undefined && isDeletedDelta(d2ValueAtIdx)) {
+						continue;
+					}
+				}
+
+				const d2Value = (delta2 as Record<string, unknown>)[key] as Delta;
+				if (d2Value !== undefined) {
+					const composed = this.composeDelta(value, d2Value, [...path, key]);
+					if (composed !== undefined) result[key] = composed;
+				} else {
+					result[key] = value;
+				}
+			}
+		}
+
+		for (const key in delta2) {
+			if (key === '_t') continue;
+
+			if (key.startsWith('_')) {
+				const intermediateIdx = parseInt(key.substring(1), 10);
+				const value = (delta2 as Record<string, unknown>)[key] as Delta;
+
+				if (d1Additions.has(intermediateIdx)) {
+					const addKey = String(intermediateIdx);
+					if (result[addKey] !== undefined) delete result[addKey];
+					continue;
+				}
+
+				let handledByD1Move = false;
+				for (const [, targetIdx] of d1Moves) {
+					if (targetIdx === intermediateIdx) {
+						handledByD1Move = true;
+						break;
+					}
+				}
+				if (handledByD1Move) continue;
+
+				const originalIdx = this.mapIntermediateToOriginal(
+					intermediateIdx,
+					d1Moves,
+					d1Additions,
+					d1Deletions,
+				);
+				if (originalIdx === null) continue;
+
+				const remappedKey = `_${originalIdx}`;
+				if (result[remappedKey] === undefined) {
+					if (isMovedDelta(value)) {
+						result[remappedKey] = [value[0], value[1], DELTA_TYPE_MOVED] as MovedDelta;
+					} else {
+						result[remappedKey] = value;
+					}
+				}
+			} else {
+				if (result[key] === undefined) {
+					result[key] = (delta2 as Record<string, unknown>)[key];
+				}
+			}
+		}
+
+		const keys = Object.keys(result).filter((k) => k !== '_t');
+		return keys.length > 0 ? (result as unknown as Delta) : undefined;
+	}
+
+	private mapIntermediateToOriginal(
+		intermediateIdx: number,
+		moves: Map<number, number>,
+		additions: Set<number>,
+		deletions: Set<number>,
+	): number | null {
+		for (const [origIdx, targetIdx] of moves) {
+			if (targetIdx === intermediateIdx) return origIdx;
+		}
+		if (additions.has(intermediateIdx)) return null;
+
+		let additionsBefore = 0;
+		for (const addIdx of additions) {
+			if (addIdx <= intermediateIdx) additionsBefore++;
+		}
+		for (const [, targetIdx] of moves) {
+			if (targetIdx <= intermediateIdx) additionsBefore++;
+		}
+
+		const logicalPos = intermediateIdx - additionsBefore;
+		let originalIdx = logicalPos;
+
+		const sortedDeletions = Array.from(deletions).sort((a, b) => a - b);
+		for (const delIdx of sortedDeletions) {
+			if (delIdx <= originalIdx) originalIdx++;
+		}
+
+		for (const [origIdx] of moves) {
+			if (origIdx <= originalIdx && !deletions.has(origIdx)) originalIdx++;
+		}
+
+		return originalIdx;
+	}
+
+	private deepEqual(a: unknown, b: unknown): boolean {
+		if (a === b) return true;
+		if (typeof a !== typeof b) return false;
+		if (a === null || b === null) return a === b;
+		if (typeof a !== 'object') return false;
+		if (Array.isArray(a) && Array.isArray(b)) {
+			if (a.length !== b.length) return false;
+			return a.every((val, idx) => this.deepEqual(val, b[idx]));
+		}
+		if (Array.isArray(a) || Array.isArray(b)) return false;
+		const aObj = a as Record<string, unknown>;
+		const bObj = b as Record<string, unknown>;
+		const aKeys = Object.keys(aObj);
+		const bKeys = Object.keys(bObj);
+		if (aKeys.length !== bKeys.length) return false;
+		return aKeys.every((key) => this.deepEqual(aObj[key], bObj[key]));
 	}
 }
 
