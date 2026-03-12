@@ -117,14 +117,16 @@ class DiffPatcher {
 			return [patched];
 		}
 
-		if (
+		const d1IsObj =
 			typeof delta1 === 'object' &&
-			typeof delta2 === 'object' &&
 			delta1 !== null &&
+			!Array.isArray(delta1);
+		const d2IsObj =
+			typeof delta2 === 'object' &&
 			delta2 !== null &&
-			!Array.isArray(delta1) &&
-			!Array.isArray(delta2)
-		) {
+			!Array.isArray(delta2);
+
+		if (d1IsObj && d2IsObj) {
 			const isArr1 = isArrayDelta(delta1 as Delta);
 			const isArr2 = isArrayDelta(delta2 as Delta);
 			if (isArr1 && isArr2) {
@@ -141,6 +143,30 @@ class DiffPatcher {
 					path,
 				);
 			}
+		}
+
+		if (d1IsObj && !isArrayDelta(delta1 as Delta) && Array.isArray(delta2)) {
+			const d2Arr = delta2 as unknown[];
+			if (isModifiedDelta(d2Arr as Delta)) {
+				const original = this.unpatch(d2Arr[0], delta1 as Delta);
+				if (this.deepEqual(original, d2Arr[1])) return undefined;
+				return [original, d2Arr[1]];
+			}
+			if (isDeletedDelta(d2Arr as Delta)) {
+				const original = this.unpatch(d2Arr[0], delta1 as Delta);
+				return [
+					original,
+					DELTA_DELETED_MARKER,
+					DELTA_DELETED_MARKER,
+				] as DeletedDelta;
+			}
+		}
+
+		if (Array.isArray(delta1) && isModifiedDelta(delta1 as Delta) && d2IsObj && !isArrayDelta(delta2 as Delta)) {
+			const d1Arr = delta1 as unknown[];
+			const result = this.patch(this.clone(d1Arr[1]), delta2 as Delta);
+			if (this.deepEqual(d1Arr[0], result)) return undefined;
+			return [d1Arr[0], result];
 		}
 
 		this.throwIncompatible(path);
@@ -263,11 +289,22 @@ class DiffPatcher {
 		if (!options?.textDiff?.diffMatchPatch) return null;
 		const dmp = new options.textDiff.diffMatchPatch();
 		const patches = dmp.patch_fromText(patchString);
+		if (patches.length === 0) return null;
 		let text = '';
+		let pos = 0;
 		for (const patch of patches) {
-			for (const [op, content] of patch.diffs) {
-				if (op !== 1) text += content;
+			const hunkStart = patch.start1 as number;
+			if (hunkStart > pos) {
+				text += '\x00'.repeat(hunkStart - pos);
 			}
+			let hunkOrigLen = 0;
+			for (const [op, content] of patch.diffs) {
+				if (op !== 1) {
+					text += content;
+					hunkOrigLen += content.length;
+				}
+			}
+			pos = hunkStart + hunkOrigLen;
 		}
 		return text.length > 0 ? text : null;
 	}
@@ -277,15 +314,92 @@ class DiffPatcher {
 		delta2: TextDiffDelta,
 		path: string[],
 	): Delta {
-		const originalText = this.extractOriginalTextFromPatch(delta1[0]);
-		if (originalText === null) this.throwIncompatible(path);
-		const intermediate = this.applyTextPatch(originalText, delta1[0], path);
-		const final = this.applyTextPatch(intermediate, delta2[0], path);
-		if (originalText === final) return undefined;
-		const composedDelta = this.diff(originalText, final);
+		const options = this.processor.options();
+		if (!options?.textDiff?.diffMatchPatch) this.throwIncompatible(path);
+		const dmp = new options.textDiff.diffMatchPatch();
+		const patches1 = dmp.patch_fromText(delta1[0]);
+		const patches2 = dmp.patch_fromText(delta2[0]);
+		if (patches1.length === 0 || patches2.length === 0)
+			this.throwIncompatible(path);
+
+		const p1Output = new Map<number, string>();
+		for (const p of patches1) {
+			let pos = p.start2 as number;
+			for (const [op, content] of p.diffs as [number, string][]) {
+				if (op !== -1) {
+					for (let i = 0; i < content.length; i++)
+						p1Output.set(pos + i, content[i]);
+					pos += content.length;
+				}
+			}
+		}
+
+		const p2Input = new Map<number, string>();
+		let p2Delta = 0;
+		for (const p of patches2) {
+			const absStart = (p.start1 as number) - p2Delta;
+			let pos = absStart;
+			for (const [op, content] of p.diffs as [number, string][]) {
+				if (op !== 1) {
+					for (let i = 0; i < content.length; i++)
+						p2Input.set(pos + i, content[i]);
+					pos += content.length;
+				}
+			}
+			p2Delta += (p.length2 as number) - (p.length1 as number);
+		}
+
+		for (const [pos, ch] of p2Input) {
+			if (p1Output.has(pos) && p1Output.get(pos) !== ch)
+				this.throwIncompatible(path);
+		}
+
+		const merged = new Map(p1Output);
+		for (const [pos, ch] of p2Input) {
+			if (!merged.has(pos)) merged.set(pos, ch);
+		}
+		let maxPos = 0;
+		for (const k of merged.keys()) if (k > maxPos) maxPos = k;
+		let intermediate = '';
+		for (let i = 0; i <= maxPos; i++)
+			intermediate += merged.get(i) ?? ' ';
+
+		const reversed1: {
+			start1: number;
+			length1: number;
+			start2: number;
+			length2: number;
+			diffs: [number, string][];
+		}[] = [];
+		for (const p of patches1) {
+			reversed1.push({
+				start1: p.start2 as number,
+				length1: p.length2 as number,
+				start2: p.start1 as number,
+				length2: p.length1 as number,
+				diffs: (p.diffs as [number, string][]).map((d) => [
+					d[0] === 1 ? -1 : d[0] === -1 ? 1 : 0,
+					d[1],
+				]),
+			});
+		}
+
+		const [approxOriginal, app1] = dmp.patch_apply(
+			reversed1,
+			intermediate,
+		);
+		for (const ok of app1 as boolean[]) {
+			if (!ok) this.throwIncompatible(path);
+		}
+		const [approxFinal, app2] = dmp.patch_apply(patches2, intermediate);
+		for (const ok of app2 as boolean[]) {
+			if (!ok) this.throwIncompatible(path);
+		}
+		if (approxOriginal === approxFinal) return undefined;
+		const composedDelta = this.diff(approxOriginal, approxFinal);
 		if (isTextDiffDelta(composedDelta)) return composedDelta;
 		if (isModifiedDelta(composedDelta)) return composedDelta;
-		return [originalText, final];
+		return [approxOriginal as string, approxFinal as string];
 	}
 
 	private composeObjectDelta(
@@ -466,6 +580,9 @@ class DiffPatcher {
 		if (typeof a !== typeof b) return false;
 		if (a === null || b === null) return a === b;
 		if (typeof a !== 'object') return false;
+		if (a instanceof Date && b instanceof Date)
+			return a.getTime() === b.getTime();
+		if (a instanceof Date || b instanceof Date) return false;
 		if (Array.isArray(a) && Array.isArray(b)) {
 			if (a.length !== b.length) return false;
 			return a.every((val, idx) => this.deepEqual(val, b[idx]));
