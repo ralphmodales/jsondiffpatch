@@ -1161,4 +1161,165 @@ describe("compose", () => {
 			expect(instance.patch(instance.clone(obj1), composed)).toEqual(obj3);
 		});
 	});
+
+	describe("module-level compose export", () => {
+		it("should compose real sequential deltas via module export", () => {
+			const obj1 = { a: 1, b: 2, c: { d: 3 } };
+			const obj2 = { a: 5, b: 2, c: { d: 3, e: 4 } };
+			const obj3 = { a: 5, b: 7, c: { d: 3, e: 4 } };
+
+			const delta1 = jsondiffpatch.diff(obj1, obj2);
+			const delta2 = jsondiffpatch.diff(obj2, obj3);
+			const composed = jsondiffpatch.compose(delta1, delta2);
+
+			const result = jsondiffpatch.patch(
+				jsondiffpatch.clone(obj1),
+				composed,
+			);
+			expect(result).toEqual(obj3);
+
+			const sequential = jsondiffpatch.patch(
+				jsondiffpatch.patch(jsondiffpatch.clone(obj1), delta1),
+				delta2,
+			);
+			expect(result).toEqual(sequential);
+		});
+	});
+
+	describe("default-mode value 0 cancellation", () => {
+		it("should cancel 0 → 1 → 0 in default mode (0 is real value, not sentinel)", () => {
+			const instance = jsondiffpatch.create();
+			const delta1 = instance.diff({ a: 0 }, { a: 1 });
+			const delta2 = instance.diff({ a: 1 }, { a: 0 });
+
+			expect(delta1).toEqual({ a: [0, 1] });
+			expect(delta2).toEqual({ a: [1, 0] });
+
+			const composed = instance.compose(delta1, delta2);
+			expect(composed).toBeUndefined();
+		});
+
+		it("should compose 0 → 1 → 2 in default mode", () => {
+			const instance = jsondiffpatch.create();
+			const delta1 = instance.diff({ a: 0 }, { a: 1 });
+			const delta2 = instance.diff({ a: 1 }, { a: 2 });
+
+			const composed = instance.compose(delta1, delta2);
+			expect(composed).toEqual({ a: [0, 2] });
+			expect(instance.patch({ a: 0 }, composed)).toEqual({ a: 2 });
+		});
+	});
+
+	describe("replacement followed by array delta", () => {
+		it("should compose whole-value replacement with subsequent array delta", () => {
+			const instance = jsondiffpatch.create();
+			const obj1 = { a: "old" as unknown };
+			const obj2 = { a: [1, 2, 3] };
+			const obj3 = { a: [1, 5, 3] };
+
+			const delta1 = instance.diff(obj1, obj2);
+			const delta2 = instance.diff(obj2, obj3);
+			const composed = instance.compose(delta1, delta2);
+
+			const result = instance.patch(instance.clone(obj1), composed);
+			expect(result).toEqual(obj3);
+
+			const sequential = instance.patch(
+				instance.patch(instance.clone(obj1), delta1),
+				delta2,
+			);
+			expect(result).toEqual(sequential);
+		});
+
+		it("should compose replacement to object then array delta on nested property", () => {
+			const instance = jsondiffpatch.create();
+			const obj1 = { a: "old" as unknown };
+			const obj2 = { a: { items: [1, 2] } };
+			const obj3 = { a: { items: [1, 2, 3] } };
+
+			const delta1 = instance.diff(obj1, obj2);
+			const delta2 = instance.diff(obj2, obj3);
+			const composed = instance.compose(delta1, delta2);
+
+			const result = instance.patch(instance.clone(obj1), composed);
+			expect(result).toEqual(obj3);
+		});
+	});
+
+	describe("array add-then-move", () => {
+		it("should preserve item added by delta1 then moved by delta2", () => {
+			const instance = jsondiffpatch.create({
+				objectHash: (obj: { id?: number }) => obj?.id?.toString(),
+			});
+
+			const arr1 = [{ id: 1, v: "a" }, { id: 2, v: "b" }];
+			const arr2 = [{ id: 1, v: "a" }, { id: 2, v: "b" }, { id: 3, v: "new" }];
+			const arr3 = [{ id: 3, v: "new" }, { id: 1, v: "a" }, { id: 2, v: "b" }];
+
+			const delta1 = instance.diff(arr1, arr2);
+			const delta2 = instance.diff(arr2, arr3);
+			const composed = instance.compose(delta1, delta2);
+
+			const result = instance.patch(instance.clone(arr1), composed);
+			expect(result).toEqual(arr3);
+
+			const sequential = instance.patch(
+				instance.patch(instance.clone(arr1), delta1),
+				delta2,
+			);
+			expect(result).toEqual(sequential);
+		});
+
+		it("should fold add-then-move with modification at final position", () => {
+			const instance = jsondiffpatch.create({
+				objectHash: (obj: { id?: number }) => obj?.id?.toString(),
+			});
+
+			const arr1 = [{ id: 1, v: "a" }];
+			const arr2 = [{ id: 1, v: "a" }, { id: 2, v: "new" }];
+			const arr3 = [{ id: 2, v: "changed" }, { id: 1, v: "a" }];
+
+			const delta1 = instance.diff(arr1, arr2);
+			const delta2 = instance.diff(arr2, arr3);
+			const composed = instance.compose(delta1, delta2);
+
+			const result = instance.patch(instance.clone(arr1), composed);
+			expect(result).toEqual(arr3);
+
+			const sequential = instance.patch(
+				instance.patch(instance.clone(arr1), delta1),
+				delta2,
+			);
+			expect(result).toEqual(sequential);
+		});
+	});
+
+	describe("multi-hunk text diff composition", () => {
+		it("should compose disjoint multi-hunk edits at different positions in long text", () => {
+			const instance = jsondiffpatch.create({
+				textDiff: { diffMatchPatch: diff_match_patch, minLength: 1 },
+			});
+
+			const text1 = "The quick brown fox jumps over the lazy dog near the river bank";
+			const text2 = "The quick red fox jumps over the lazy dog near the river bank";
+			const text3 = "The quick red fox jumps over the lazy cat near the river bank";
+
+			const obj1 = { t: text1 };
+			const obj2 = { t: text2 };
+			const obj3 = { t: text3 };
+
+			const delta1 = instance.diff(obj1, obj2);
+			const delta2 = instance.diff(obj2, obj3);
+			const composed = instance.compose(delta1, delta2);
+
+			const result = instance.patch(instance.clone(obj1), composed);
+			expect(result).toEqual(obj3);
+
+			const sequential = instance.patch(
+				instance.patch(instance.clone(obj1), delta1),
+				delta2,
+			);
+			expect(result).toEqual(sequential);
+		});
+	});
 });

@@ -162,7 +162,7 @@ class DiffPatcher {
 			}
 		}
 
-		if (Array.isArray(delta1) && isModifiedDelta(delta1 as Delta) && d2IsObj && !isArrayDelta(delta2 as Delta)) {
+		if (Array.isArray(delta1) && isModifiedDelta(delta1 as Delta) && d2IsObj) {
 			const d1Arr = delta1 as unknown[];
 			const result = this.patch(this.clone(d1Arr[1]), delta2 as Delta);
 			if (this.deepEqual(d1Arr[0], result)) return undefined;
@@ -198,8 +198,9 @@ class DiffPatcher {
 
 		if (isModifiedDelta(d1)) {
 			if (isModifiedDelta(d2)) {
-				const d1IsCompact = d1[0] === DELTA_DELETED_MARKER;
-				const d2IsCompact = d2[0] === DELTA_DELETED_MARKER;
+				const compact = this.isCompactMode();
+				const d1IsCompact = compact && d1[0] === DELTA_DELETED_MARKER;
+				const d2IsCompact = compact && d2[0] === DELTA_DELETED_MARKER;
 				if (!d2IsCompact && !this.deepEqual(d1[1], d2[0])) {
 					this.throwIncompatible(path);
 				}
@@ -222,7 +223,7 @@ class DiffPatcher {
 
 		if (isDeletedDelta(d1)) {
 			if (isAddedDelta(d2)) {
-				const d1IsCompact = d1[0] === DELTA_DELETED_MARKER;
+				const d1IsCompact = this.isCompactMode() && d1[0] === DELTA_DELETED_MARKER;
 				if (d1IsCompact) {
 					return [DELTA_DELETED_MARKER, d2[0]];
 				}
@@ -432,147 +433,205 @@ class DiffPatcher {
 		delta2: ArrayDelta,
 		path: string[],
 	): Delta {
-		const result: Record<string, unknown> = { _t: 'a' };
-		const d1Moves = new Map<number, number>();
-		const d1Additions = new Set<number>();
-		const d1Deletions = new Set<number>();
+		const d1Rec = delta1 as Record<string, unknown>;
+		const d2Rec = delta2 as Record<string, unknown>;
 
-		for (const key in delta1) {
+		const structural1: Record<string, unknown> = { _t: 'a' };
+		const mods1: Record<string, Delta> = {};
+		let maxPreIdx = 0;
+		let addCount1 = 0;
+		let removeCount1 = 0;
+		let maxPostIdx1 = 0;
+		for (const key in d1Rec) {
 			if (key === '_t') continue;
-			const value = (delta1 as Record<string, unknown>)[key] as Delta;
 			if (key.startsWith('_')) {
+				structural1[key] = d1Rec[key];
 				const idx = parseInt(key.substring(1), 10);
-				if (isMovedDelta(value)) {
-					d1Moves.set(idx, value[1]);
-				} else if (isDeletedDelta(value)) {
-					d1Deletions.add(idx);
+				if (idx + 1 > maxPreIdx) maxPreIdx = idx + 1;
+				const v = d1Rec[key] as Delta;
+				if (isMovedDelta(v)) {
+					removeCount1++;
+					addCount1++;
+					const dest = v[1];
+					if (dest + 1 > maxPostIdx1) maxPostIdx1 = dest + 1;
+				} else {
+					removeCount1++;
 				}
 			} else {
 				const idx = parseInt(key, 10);
-				if (isAddedDelta(value)) d1Additions.add(idx);
+				if (idx + 1 > maxPostIdx1) maxPostIdx1 = idx + 1;
+				const v = d1Rec[key] as Delta;
+				if (isAddedDelta(v)) {
+					structural1[key] = v;
+					addCount1++;
+				} else {
+					mods1[key] = v;
+				}
 			}
 		}
+		const origSize = Math.max(
+			maxPreIdx,
+			maxPostIdx1 - addCount1 + removeCount1,
+		);
 
-		for (const key in delta1) {
+		const structural2: Record<string, unknown> = { _t: 'a' };
+		const mods2: Record<string, Delta> = {};
+		let maxPreIdx2 = 0;
+		let addCount2 = 0;
+		let removeCount2 = 0;
+		let maxPostIdx2 = 0;
+		for (const key in d2Rec) {
 			if (key === '_t') continue;
-			const value = (delta1 as Record<string, unknown>)[key] as Delta;
-
 			if (key.startsWith('_')) {
-				if (isMovedDelta(value)) {
-					const targetIdx = value[1];
-					const d2UnderscoreKey = `_${targetIdx}`;
-					const d2ValueAtTarget = (delta2 as Record<string, unknown>)[d2UnderscoreKey] as Delta;
-					if (d2ValueAtTarget !== undefined && isDeletedDelta(d2ValueAtTarget)) {
-						result[key] = [value[0], DELTA_DELETED_MARKER, DELTA_DELETED_MARKER] as DeletedDelta;
-					} else if (d2ValueAtTarget !== undefined && isMovedDelta(d2ValueAtTarget)) {
-						result[key] = [value[0], d2ValueAtTarget[1], DELTA_TYPE_MOVED] as MovedDelta;
-					} else {
-						result[key] = value;
-					}
+				structural2[key] = d2Rec[key];
+				const idx = parseInt(key.substring(1), 10);
+				if (idx + 1 > maxPreIdx2) maxPreIdx2 = idx + 1;
+				const v = d2Rec[key] as Delta;
+				if (isMovedDelta(v)) {
+					removeCount2++;
+					addCount2++;
+					const dest = v[1];
+					if (dest + 1 > maxPostIdx2) maxPostIdx2 = dest + 1;
 				} else {
-					result[key] = value;
+					removeCount2++;
 				}
 			} else {
 				const idx = parseInt(key, 10);
-				if (isAddedDelta(value)) {
-					const d2UnderscoreKey = `_${idx}`;
-					const d2ValueAtIdx = (delta2 as Record<string, unknown>)[d2UnderscoreKey] as Delta;
-					if (d2ValueAtIdx !== undefined && isDeletedDelta(d2ValueAtIdx)) {
-						continue;
-					}
-				}
-
-				const d2Value = (delta2 as Record<string, unknown>)[key] as Delta;
-				if (d2Value !== undefined) {
-					const composed = this.composeDelta(value, d2Value, [...path, key]);
-					if (composed !== undefined) result[key] = composed;
+				if (idx + 1 > maxPostIdx2) maxPostIdx2 = idx + 1;
+				const v = d2Rec[key] as Delta;
+				if (isAddedDelta(v)) {
+					structural2[key] = v;
+					addCount2++;
 				} else {
-					result[key] = value;
+					mods2[key] = v;
 				}
 			}
 		}
+		const interSize = Math.max(
+			maxPreIdx2,
+			maxPostIdx2 - addCount2 + removeCount2,
+		);
+		const size = Math.max(
+			origSize,
+			interSize - addCount1 + removeCount1,
+		);
 
-		for (const key in delta2) {
-			if (key === '_t') continue;
+		const original: unknown[] = [];
+		for (let i = 0; i < size; i++) {
+			original.push({ __ph: true, __i: i });
+		}
 
-			if (key.startsWith('_')) {
-				const intermediateIdx = parseInt(key.substring(1), 10);
-				const value = (delta2 as Record<string, unknown>)[key] as Delta;
+		const savedOpts = { ...this.processor.options() } as Options;
+		const origHash = savedOpts?.objectHash;
+		const composeHash = (obj: object) => {
+			const o = obj as { __ph?: boolean; __i?: number };
+			if (o.__ph) return `__ph_${o.__i}`;
+			return origHash ? origHash(obj) : undefined;
+		};
 
-				if (d1Additions.has(intermediateIdx)) {
-					const addKey = String(intermediateIdx);
-					if (result[addKey] !== undefined) delete result[addKey];
-					continue;
-				}
+		this.processor.options({ ...savedOpts, objectHash: composeHash });
+		try {
+			const inter = this.patch(
+				this.clone(original),
+				structural1 as Delta,
+			) as unknown[];
+			const finalArr = this.patch(
+				this.clone(inter),
+				structural2 as Delta,
+			) as unknown[];
+			const composedStructural = this.diff(original, finalArr) as
+				| Record<string, unknown>
+				| undefined;
 
-				let handledByD1Move = false;
-				for (const [, targetIdx] of d1Moves) {
-					if (targetIdx === intermediateIdx) {
-						handledByD1Move = true;
-						break;
+			const hasMods1 = Object.keys(mods1).length > 0;
+			const hasMods2 = Object.keys(mods2).length > 0;
+			if (!hasMods1 && !hasMods2) {
+				return composedStructural;
+			}
+
+			const finalMods: Record<string, Delta> = {};
+
+			if (hasMods1) {
+				const phToFinalIdx = new Map<number, number>();
+				for (let j = 0; j < finalArr.length; j++) {
+					const item = finalArr[j] as {
+						__ph?: boolean;
+						__i?: number;
+					};
+					if (item?.__ph) {
+						phToFinalIdx.set(item.__i!, j);
 					}
 				}
-				if (handledByD1Move) continue;
+				for (const key in mods1) {
+					const interIdx = parseInt(key, 10);
+					const item = inter[interIdx] as {
+						__ph?: boolean;
+						__i?: number;
+					};
+					if (item?.__ph && phToFinalIdx.has(item.__i!)) {
+						const finalIdx = phToFinalIdx.get(item.__i!)!;
+						finalMods[finalIdx.toString()] = mods1[key];
+					}
+				}
+			}
 
-				const originalIdx = this.mapIntermediateToOriginal(
-					intermediateIdx,
-					d1Moves,
-					d1Additions,
-					d1Deletions,
-				);
-				if (originalIdx === null) continue;
-
-				const remappedKey = `_${originalIdx}`;
-				if (result[remappedKey] === undefined) {
-					if (isMovedDelta(value)) {
-						result[remappedKey] = [value[0], value[1], DELTA_TYPE_MOVED] as MovedDelta;
+			if (hasMods2) {
+				for (const key in mods2) {
+					if (finalMods[key] !== undefined) {
+						const composed = this.composeDelta(
+							finalMods[key],
+							mods2[key],
+							[...path, key],
+						);
+						if (composed !== undefined) {
+							finalMods[key] = composed;
+						} else {
+							delete finalMods[key];
+						}
 					} else {
-						result[remappedKey] = value;
+						finalMods[key] = mods2[key];
 					}
 				}
-			} else {
-				if (result[key] === undefined) {
-					result[key] = (delta2 as Record<string, unknown>)[key];
+			}
+
+			if (Object.keys(finalMods).length === 0) {
+				return composedStructural;
+			}
+
+			const result: Record<string, unknown> = composedStructural
+				? { ...composedStructural }
+				: { _t: 'a' };
+
+			for (const key in finalMods) {
+				if (finalMods[key] === undefined) continue;
+				const existing = result[key] as Delta;
+				if (existing !== undefined && isAddedDelta(existing)) {
+					const addedValue = (existing as unknown[])[0];
+					const patched = this.patch(
+						this.clone(addedValue),
+						finalMods[key],
+					);
+					result[key] = [patched];
+				} else {
+					result[key] = finalMods[key];
 				}
 			}
-		}
 
-		const keys = Object.keys(result).filter((k) => k !== '_t');
-		return keys.length > 0 ? (result as unknown as Delta) : undefined;
+			let hasEntries = false;
+			for (const key in result) {
+				if (key !== '_t') {
+					hasEntries = true;
+					break;
+				}
+			}
+			return hasEntries ? (result as Delta) : undefined;
+		} finally {
+			this.processor.options(savedOpts);
+		}
 	}
 
-	private mapIntermediateToOriginal(
-		intermediateIdx: number,
-		moves: Map<number, number>,
-		additions: Set<number>,
-		deletions: Set<number>,
-	): number | null {
-		for (const [origIdx, targetIdx] of moves) {
-			if (targetIdx === intermediateIdx) return origIdx;
-		}
-		if (additions.has(intermediateIdx)) return null;
-
-		let additionsBefore = 0;
-		for (const addIdx of additions) {
-			if (addIdx <= intermediateIdx) additionsBefore++;
-		}
-		for (const [, targetIdx] of moves) {
-			if (targetIdx <= intermediateIdx) additionsBefore++;
-		}
-
-		const logicalPos = intermediateIdx - additionsBefore;
-		let originalIdx = logicalPos;
-
-		const sortedDeletions = Array.from(deletions).sort((a, b) => a - b);
-		for (const delIdx of sortedDeletions) {
-			if (delIdx <= originalIdx) originalIdx++;
-		}
-
-		for (const [origIdx] of moves) {
-			if (origIdx <= originalIdx && !deletions.has(origIdx)) originalIdx++;
-		}
-
-		return originalIdx;
+	private isCompactMode(): boolean {
+		return this.processor.options()?.omitRemovedValues === true;
 	}
 
 	private deepEqual(a: unknown, b: unknown): boolean {
