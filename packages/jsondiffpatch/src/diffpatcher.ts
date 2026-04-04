@@ -4,16 +4,26 @@ import PatchContext from "./contexts/patch.js";
 import ReverseContext from "./contexts/reverse.js";
 import Pipe from "./pipe.js";
 import Processor from "./processor.js";
+import {
+	resolveStrategyFromOptions,
+	StrategyCache,
+} from "./strategy.js";
 
 import * as arrays from "./filters/arrays.js";
 import * as dates from "./filters/dates.js";
 import * as nested from "./filters/nested.js";
 import * as texts from "./filters/texts.js";
 import * as trivial from "./filters/trivial.js";
-import type { Delta, Options } from "./types.js";
+import type {
+	ArrayDiffStrategy,
+	Delta,
+	MatchByOption,
+	Options,
+} from "./types.js";
 
 class DiffPatcher {
 	processor: Processor;
+	private strategyCache = new StrategyCache();
 
 	constructor(options?: Options) {
 		this.processor = new Processor(options);
@@ -59,7 +69,44 @@ class DiffPatcher {
 		return this.processor.options(options);
 	}
 
+	resolveStrategy(
+		path: string,
+		left: readonly unknown[],
+		right: readonly unknown[],
+	) {
+		return resolveStrategyFromOptions(this.processor.options(), path, left, right);
+	}
+
+	withStrategy(
+		path: string,
+		strategy:
+			| ArrayDiffStrategy
+			| ((item: object, index: number) => string | undefined),
+	) {
+		const options = this.processor.options();
+		const current = options.matchBy;
+		const map =
+			current && typeof current !== "function"
+				? { ...current }
+				: ({} as Exclude<MatchByOption, Function>);
+		map[path] = strategy;
+		options.matchBy = map;
+		return this;
+	}
+
 	diff(left: unknown, right: unknown) {
+		const options = this.processor.options();
+		if (options.matchBy) {
+			this.strategyCache.clear();
+			options._resolveStrategy = (path, l, r) => {
+				if (!this.strategyCache.has(path)) {
+					this.strategyCache.set(path, this.resolveStrategy(path, l, r));
+				}
+				return this.strategyCache.get(path);
+			};
+		} else {
+			options._resolveStrategy = undefined;
+		}
 		return this.processor.process(new DiffContext(left, right));
 	}
 

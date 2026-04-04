@@ -1,11 +1,16 @@
 import DiffContext from "../contexts/diff.js";
 import PatchContext from "../contexts/patch.js";
 import ReverseContext from "../contexts/reverse.js";
+import {
+	findBestMoveCandidate,
+	resolveStrategyFromOptions,
+} from "../strategy.js";
 
 import lcs from "./lcs.js";
 
 import type {
 	AddedDelta,
+	ArrayDiffStrategy,
 	ArrayDelta,
 	DeletedDelta,
 	Delta,
@@ -41,8 +46,56 @@ export interface MatchContext {
 		| ((item: object, index?: number) => string | undefined)
 		| undefined;
 	matchByPosition?: boolean | undefined;
+	equal?: ArrayDiffStrategy["equal"];
+	weight?: ArrayDiffStrategy["weight"];
+	onMatch?: ArrayDiffStrategy["onMatch"];
 	hashCache1?: (string | undefined)[];
 	hashCache2?: (string | undefined)[];
+}
+
+function resolveStrategyForContext(context: DiffContext) {
+	const left = context.left as readonly unknown[];
+	const right = context.right as readonly unknown[];
+	const path = context.getPath();
+	return (
+		context.options?._resolveStrategy?.(path, left, right) ??
+		resolveStrategyFromOptions(context.options, path, left, right)
+	);
+}
+
+function buildMatchContext(
+	strategy: ArrayDiffStrategy | undefined,
+	fallbackObjectHash:
+		| ((item: object, index?: number) => string | undefined)
+		| undefined,
+	matchByPosition: boolean | undefined,
+): MatchContext {
+	if (strategy) {
+		return {
+			objectHash: strategy.hash
+				? (item, index) => strategy.hash?.(item, index ?? 0)
+				: undefined,
+			matchByPosition,
+			equal: strategy.equal,
+			weight: strategy.weight,
+			onMatch: strategy.onMatch,
+		};
+	}
+	return {
+		objectHash: fallbackObjectHash,
+		matchByPosition,
+	};
+}
+
+function isWeightedMatch(
+	context: MatchContext,
+	value1: unknown,
+	value2: unknown,
+): boolean {
+	if (!context.weight) {
+		return true;
+	}
+	return context.weight(value1, value2) > 0;
 }
 
 function matchItems(
@@ -59,6 +112,16 @@ function matchItems(
 	}
 	if (typeof value1 !== "object" || typeof value2 !== "object") {
 		return false;
+	}
+	if (context.equal) {
+		if (!context.equal(value1, value2)) {
+			return false;
+		}
+		if (!isWeightedMatch(context, value1, value2)) {
+			return false;
+		}
+		context.onMatch?.(value1, value2);
+		return true;
 	}
 	const objectHash = context.objectHash;
 	if (!objectHash) {
@@ -81,7 +144,14 @@ function matchItems(
 	if (typeof hash2 === "undefined") {
 		return false;
 	}
-	return hash1 === hash2;
+	if (hash1 !== hash2) {
+		return false;
+	}
+	if (!isWeightedMatch(context, value1, value2)) {
+		return false;
+	}
+	context.onMatch?.(value1, value2);
+	return true;
 }
 
 export const diffFilter: Filter<DiffContext> = function arraysDiffFilter(
@@ -91,17 +161,30 @@ export const diffFilter: Filter<DiffContext> = function arraysDiffFilter(
 		return;
 	}
 
-	const matchContext: MatchContext = {
-		objectHash: context.options?.objectHash,
-		matchByPosition: context.options?.matchByPosition,
-	};
+	const array1 = context.left as readonly unknown[];
+	const array2 = context.right as readonly unknown[];
+	const strategy = resolveStrategyForContext(context);
+	context.resolvedStrategy = strategy;
+	if (strategy?.shouldDiff !== undefined) {
+		if (!strategy.shouldDiff(array1, array2)) {
+			if (JSON.stringify(context.left) === JSON.stringify(context.right)) {
+				context.setResult(undefined).exit();
+				return;
+			}
+			context.setResult([context.left, context.right]).exit();
+			return;
+		}
+	}
+	const matchContext = buildMatchContext(
+		strategy,
+		context.options?.objectHash,
+		context.options?.matchByPosition,
+	);
 	let commonHead = 0;
 	let commonTail = 0;
 	let index: number | undefined;
 	let index1: number | undefined;
 	let index2: number | undefined;
-	const array1 = context.left as readonly unknown[];
-	const array2 = context.right as readonly unknown[];
 	const len1 = array1.length;
 	const len2 = array2.length;
 
@@ -194,7 +277,35 @@ export const diffFilter: Filter<DiffContext> = function arraysDiffFilter(
 	// diff is not trivial, find the LCS (Longest Common Subsequence)
 	const trimmed1 = array1.slice(commonHead, len1 - commonTail);
 	const trimmed2 = array2.slice(commonHead, len2 - commonTail);
-	const seq = lcs.get(trimmed1, trimmed2, matchItems, matchContext);
+	const seq =
+		matchContext.equal && !matchContext.objectHash
+			? (() => {
+					const swapped = lcs.get(
+						trimmed2,
+						trimmed1,
+						(
+							arrayOnRight,
+							arrayOnLeft,
+							indexOnRight,
+							indexOnLeft,
+							currentMatchContext,
+						) =>
+							matchItems(
+								arrayOnLeft,
+								arrayOnRight,
+								indexOnLeft,
+								indexOnRight,
+								currentMatchContext,
+							),
+						matchContext,
+					);
+					return {
+						sequence: swapped.sequence,
+						indices1: swapped.indices2,
+						indices2: swapped.indices1,
+					};
+				})()
+			: lcs.get(trimmed1, trimmed2, matchItems, matchContext);
 	const removedItems = [];
 	result = result || {
 		_t: "a",
@@ -226,39 +337,36 @@ export const diffFilter: Filter<DiffContext> = function arraysDiffFilter(
 			// added, try to match with a removed item and register as position move
 			let isMove = false;
 			if (detectMove && removedItemsLength > 0) {
-				for (
-					let removeItemIndex1 = 0;
-					removeItemIndex1 < removedItemsLength;
-					removeItemIndex1++
-				) {
-					index1 = removedItems[removeItemIndex1];
-					const resultItem =
-						index1 === undefined ? undefined : result[`_${index1}`];
-					if (
-						index1 !== undefined &&
-						resultItem &&
+				const bestRemIdx = findBestMoveCandidate(
+					removedItems,
+					(ri) =>
 						matchItems(
 							trimmed1,
 							trimmed2,
-							index1 - commonHead,
+							ri - commonHead,
 							index - commonHead,
 							matchContext,
-						)
-					) {
-						// store position move as: [originalValue, newPosition, ARRAY_MOVE]
+						),
+					matchContext.weight
+						? (ri) => matchContext.weight!(array1[ri], array2[index])
+						: undefined,
+				);
+				if (bestRemIdx >= 0) {
+					index1 = removedItems[bestRemIdx];
+					const resultItem =
+						index1 === undefined ? undefined : result[`_${index1}`];
+					if (index1 !== undefined && resultItem) {
 						resultItem.splice(1, 2, index, ARRAY_MOVE);
 						resultItem.splice(1, 2, index, ARRAY_MOVE);
 						if (!includeValueOnMove) {
-							// don't include moved value on diff, to save bytes
 							resultItem[0] = "";
 						}
 
 						index2 = index;
 						child = new DiffContext(array1[index1], array2[index2]);
 						context.push(child, index2);
-						removedItems.splice(removeItemIndex1, 1);
+						removedItems.splice(bestRemIdx, 1);
 						isMove = true;
-						break;
 					}
 				}
 			}

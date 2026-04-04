@@ -5,6 +5,12 @@ import type DiffContext from "./contexts/diff.js";
 export interface Options {
 	objectHash?: (item: object, index?: number) => string | undefined;
 	matchByPosition?: boolean;
+	matchBy?: MatchByOption;
+	_resolveStrategy?: (
+		path: string,
+		left: readonly unknown[],
+		right: readonly unknown[],
+	) => ArrayDiffStrategy | undefined;
 	arrays?: {
 		detectMove?: boolean;
 		includeValueOnMove?: boolean;
@@ -17,6 +23,25 @@ export interface Options {
 	cloneDiffValues?: boolean | ((value: unknown) => unknown);
 	omitRemovedValues?: boolean;
 }
+
+export interface ArrayDiffStrategy {
+	hash?: (item: object, index: number) => string | undefined;
+	equal?: (a: unknown, b: unknown) => boolean;
+	shouldDiff?: (left: readonly unknown[], right: readonly unknown[]) => boolean;
+	weight?: (a: unknown, b: unknown) => number;
+	onMatch?: (a: unknown, b: unknown) => void;
+}
+
+export type MatchByOption =
+	| Record<
+			string,
+			ArrayDiffStrategy | ((item: object, index: number) => string | undefined)
+	  >
+	| ((
+			path: string,
+			left: readonly unknown[],
+			right: readonly unknown[],
+	  ) => ArrayDiffStrategy | undefined);
 
 export type AddedDelta = [unknown];
 export type ModifiedDelta = [unknown, unknown];

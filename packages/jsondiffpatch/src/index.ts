@@ -5,11 +5,20 @@ import type ReverseContext from "./contexts/reverse.js";
 import dateReviver from "./date-reviver.js";
 import DiffPatcher from "./diffpatcher.js";
 import type { Delta, Options } from "./types.js";
+export {
+	combineStrategies,
+	createEqualStrategy,
+	createHashStrategy,
+	createShouldDiffStrategy,
+	createWeightedStrategy,
+	isArrayDiffStrategy,
+} from "./strategy.js";
 
 export { DiffPatcher, dateReviver };
 
 export type * from "./types.js";
 export type { Context, DiffContext, PatchContext, ReverseContext };
+export type { ArrayDiffStrategy, MatchByOption } from "./types.js";
 
 export function create(options?: Options) {
 	return new DiffPatcher(options);

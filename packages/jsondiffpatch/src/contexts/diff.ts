@@ -1,5 +1,5 @@
 import defaultClone from "../clone.js";
-import type { Delta } from "../types.js";
+import type { ArrayDiffStrategy, Delta } from "../types.js";
 import Context from "./context.js";
 
 class DiffContext extends Context<Delta> {
@@ -11,6 +11,9 @@ class DiffContext extends Context<Delta> {
 	rightType?: string;
 	leftIsArray?: boolean;
 	rightIsArray?: boolean;
+	resolvedStrategy?: ArrayDiffStrategy;
+
+	private _path?: string;
 
 	constructor(left: unknown, right: unknown) {
 		super();
@@ -53,6 +56,22 @@ class DiffContext extends Context<Delta> {
 	setResult(result: Delta) {
 		this.prepareDeltaResult(result);
 		return super.setResult(result);
+	}
+
+	getPath() {
+		if (typeof this._path !== "undefined") {
+			return this._path;
+		}
+		const segments: string[] = [];
+		let context: DiffContext | undefined = this;
+		while (context?.parent) {
+			if (typeof context.childName !== "undefined") {
+				segments.unshift(String(context.childName));
+			}
+			context = context.parent;
+		}
+		this._path = segments.length > 0 ? `/${segments.join("/")}` : "";
+		return this._path;
 	}
 }
 
